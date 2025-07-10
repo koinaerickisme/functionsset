@@ -162,6 +162,7 @@ app.post("/withdraw", async (req, res) => {
 // ✅ Mark request as completed
 app.post("/request-completed", async (req, res) => {
   const { before, after, requestId } = req.body;
+  console.log("request-completed called", { before, after, requestId });
 
   if (
     before.status !== "completed" &&
@@ -174,6 +175,7 @@ app.post("/request-completed", async (req, res) => {
       const userId = after.userId;
       const weight = after.weight;
       const wasteType = after.wasteType;
+      console.log("Processing completion for user:", userId);
 
       const priceSnap = await admin
         .firestore()
@@ -186,42 +188,49 @@ app.post("/request-completed", async (req, res) => {
         : 0;
 
       if (!pricePerKg) {
+        console.log("Invalid price per kg for wasteType:", wasteType);
         return res.status(400).json({ error: "Invalid price per kg" });
       }
 
       const amount = weight * pricePerKg;
+      console.log("Crediting amount:", amount);
 
       const userRef = admin.firestore().collection("users").doc(userId);
-await admin.firestore().runTransaction(async (transaction) => {
-  transaction.update(userRef, {
-    walletBalance: admin.firestore.FieldValue.increment(amount),
-    recycledWeight: admin.firestore.FieldValue.increment(weight),
-    pointsEarned: admin.firestore.FieldValue.increment(weight / 50),
-    co2Saved: admin.firestore.FieldValue.increment(weight * 1.5),
-  });
+      await admin.firestore().runTransaction(async (transaction) => {
+        const userSnap = await transaction.get(userRef);
+        if (!userSnap.exists) {
+          throw new Error("User not found");
+        }
+        transaction.update(userRef, {
+          walletBalance: admin.firestore.FieldValue.increment(amount),
+          recycledWeight: admin.firestore.FieldValue.increment(weight),
+          pointsEarned: admin.firestore.FieldValue.increment(weight / 50),
+          co2Saved: admin.firestore.FieldValue.increment(weight * 1.5),
+        });
 
-  const walletTxRef = admin.firestore().collection("wallet_transactions").doc();
-  transaction.set(walletTxRef, {
-    userId,
-    type: "Recycle Credit",
-    amount,
-    relatedRequest: requestId,
-    timestamp: admin.firestore.FieldValue.serverTimestamp(),
-    status: "completed",
-    details: `Credited for recycling ${weight}kg of ${wasteType}`,
-  });
-});
+        const walletTxRef = admin.firestore().collection("wallet_transactions").doc();
+        transaction.set(walletTxRef, {
+          userId,
+          type: "Recycle Credit",
+          amount,
+          relatedRequest: requestId,
+          timestamp: admin.firestore.FieldValue.serverTimestamp(),
+          status: "completed",
+          details: `Credited for recycling ${weight}kg of ${wasteType}`,
+        });
+      });
 
+      console.log("Transaction completed for user:", userId);
       return res.json({ success: true });
     } catch (err) {
       console.error("❌ request-completed error:", err);
       return res.status(500).json({ error: err.message });
     }
   } else {
+    console.log("No update needed for request-completed");
     return res.status(200).json({ message: "No update needed." });
   }
 });
-
 // ✅ Start Express Server
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
