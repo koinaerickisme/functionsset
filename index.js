@@ -3,74 +3,80 @@ const admin = require("firebase-admin");
 const cors = require("cors");
 const Africastalking = require("africastalking");
 
-// ✅ Load Firebase credentials from env
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
+// ✅ Load Firebase credentials safely
+let serviceAccount;
+try {
+  serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
+} catch (e) {
+  console.error("❌ Invalid Firebase service account key:", e.message);
+  process.exit(1);
+}
 
+// ✅ Initialize Firebase
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
+// ✅ Initialize Express
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ✅ Africa’s Talking setup
+// ✅ Initialize Africa's Talking
 const africastalking = Africastalking({
-  apiKey: process.env.AT_API_KEY,       // Set this in Render
-  username: process.env.AT_USERNAME,    // Usually 'sandbox'
+  apiKey: process.env.AT_API_KEY,
+  username: process.env.AT_USERNAME || "mementmori", // fallback
 });
 const sms = africastalking.SMS;
 
-// ✅ In-memory OTP store (use Firestore for production)
+// ✅ In-memory OTP store (use Firestore or Redis in production)
 const otpStore = {};
 
-// ✅ Health check
+// ✅ Health Check
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-// ✅ SEND OTP
+// ✅ Send OTP
 app.post("/send-otp", async (req, res) => {
   const { phoneNumber } = req.body;
   if (!phoneNumber) return res.status(400).json({ error: "Phone number required" });
 
-  const otp = Math.floor(100000 + Math.random() * 900000); // 6-digit code
-  const expiresAt = Date.now() + 5 * 60 * 1000; // expires in 5 minutes
-
+  const otp = Math.floor(100000 + Math.random() * 900000);
+  const expiresAt = Date.now() + 5 * 60 * 1000;
   otpStore[phoneNumber] = { otp, expiresAt };
 
   try {
     const response = await sms.send({
       to: [phoneNumber],
       message: `Your verification code is ${otp}`,
-      from: "AFRICASTKNG", // Use default or approved Sender ID
+      from: "AFRICASTKNG",
     });
 
     return res.json({ success: true, message: "OTP sent", response });
   } catch (error) {
-    console.error("send-otp error:", error);
+    console.error("❌ Error sending OTP:", error);
     return res.status(500).json({ error: "Failed to send OTP" });
   }
 });
 
-// ✅ VERIFY OTP
+// ✅ Verify OTP
 app.post("/verify-otp", (req, res) => {
   const { phoneNumber, otp } = req.body;
 
   const record = otpStore[phoneNumber];
-  if (!record) return res.status(400).json({ error: "No OTP found for this number" });
+  if (!record) return res.status(400).json({ error: "No OTP found" });
   if (Date.now() > record.expiresAt) return res.status(400).json({ error: "OTP expired" });
   if (record.otp.toString() !== otp.toString()) return res.status(400).json({ error: "Invalid OTP" });
 
-  delete otpStore[phoneNumber]; // Clear after verification
+  delete otpStore[phoneNumber];
   return res.json({ success: true, message: "OTP verified" });
 });
 
-// ✅ POST /update-recycled-stats
+// ✅ Update recycled stats
 app.post("/update-recycled-stats", async (req, res) => {
   try {
     const { before, after, requestId } = req.body;
-
     const userId = after?.userId || before?.userId;
     if (!userId) return res.status(400).json({ error: "No userId found" });
 
@@ -106,12 +112,12 @@ app.post("/update-recycled-stats", async (req, res) => {
 
     return res.json({ success: true });
   } catch (err) {
-    console.error("update-recycled-stats error:", err);
+    console.error("❌ update-recycled-stats error:", err);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// ✅ POST /withdraw
+// ✅ Withdraw endpoint
 app.post("/withdraw", async (req, res) => {
   const { userId, amount } = req.body;
 
@@ -148,12 +154,12 @@ app.post("/withdraw", async (req, res) => {
 
     return res.json({ success: true });
   } catch (err) {
-    console.error("withdraw error:", err);
+    console.error("❌ withdraw error:", err);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// ✅ POST /request-completed
+// ✅ Mark request as completed
 app.post("/request-completed", async (req, res) => {
   const { before, after, requestId } = req.body;
 
@@ -180,35 +186,35 @@ app.post("/request-completed", async (req, res) => {
         : 0;
 
       if (!pricePerKg) {
-        console.warn(`No price found for waste type: ${wasteType}`);
         return res.status(400).json({ error: "Invalid price per kg" });
       }
 
       const amount = weight * pricePerKg;
 
       const userRef = admin.firestore().collection("users").doc(userId);
-      await admin.firestore().runTransaction(async (transaction) => {
-        transaction.update(userRef, {
-          walletBalance: admin.firestore.FieldValue.increment(amount),
-          recycledWeight: admin.firestore.FieldValue.increment(weight),
-          pointsEarned: admin.firestore.FieldValue.increment(weight / 50),
-          co2Saved: admin.firestore.FieldValue.increment(weight * 1.5),
-        });
-      });
+await admin.firestore().runTransaction(async (transaction) => {
+  transaction.update(userRef, {
+    walletBalance: admin.firestore.FieldValue.increment(amount),
+    recycledWeight: admin.firestore.FieldValue.increment(weight),
+    pointsEarned: admin.firestore.FieldValue.increment(weight / 50),
+    co2Saved: admin.firestore.FieldValue.increment(weight * 1.5),
+  });
 
-      await admin.firestore().collection("wallet_transactions").add({
-        userId,
-        type: "Recycle Credit",
-        amount: amount,
-        relatedRequest: requestId,
-        timestamp: admin.firestore.FieldValue.serverTimestamp(),
-        status: "completed",
-        details: `Credited for recycling ${weight}kg of ${wasteType}`,
-      });
+  const walletTxRef = admin.firestore().collection("wallet_transactions").doc();
+  transaction.set(walletTxRef, {
+    userId,
+    type: "Recycle Credit",
+    amount,
+    relatedRequest: requestId,
+    timestamp: admin.firestore.FieldValue.serverTimestamp(),
+    status: "completed",
+    details: `Credited for recycling ${weight}kg of ${wasteType}`,
+  });
+});
 
       return res.json({ success: true });
     } catch (err) {
-      console.error("request-completed error:", err);
+      console.error("❌ request-completed error:", err);
       return res.status(500).json({ error: err.message });
     }
   } else {
@@ -216,7 +222,7 @@ app.post("/request-completed", async (req, res) => {
   }
 });
 
-// ✅ Start the server
+// ✅ Start Express Server
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`🚀 Server is running on port ${PORT}`);
