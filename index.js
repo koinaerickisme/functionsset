@@ -25,17 +25,15 @@ app.use(express.json());
 // ✅ Initialize Africa's Talking
 const africastalking = Africastalking({
   apiKey: process.env.AT_API_KEY,
-  username: process.env.AT_USERNAME || "mementmori", // fallback
+  username: process.env.AT_USERNAME || "mementmori",
 });
 const sms = africastalking.SMS;
 
-// ✅ In-memory OTP store (use Firestore or Redis in production)
+// ✅ In-memory OTP store (replace with Redis or Firestore in production)
 const otpStore = {};
 
 // ✅ Health Check
-app.get("/health", (req, res) => {
-  res.json({ status: "ok" });
-});
+app.get("/health", (req, res) => res.json({ status: "ok" }));
 
 // ✅ Send OTP
 app.post("/send-otp", async (req, res) => {
@@ -43,8 +41,7 @@ app.post("/send-otp", async (req, res) => {
   if (!phoneNumber) return res.status(400).json({ error: "Phone number required" });
 
   const otp = Math.floor(100000 + Math.random() * 900000);
-  const expiresAt = Date.now() + 5 * 60 * 1000;
-  otpStore[phoneNumber] = { otp, expiresAt };
+  otpStore[phoneNumber] = { otp, expiresAt: Date.now() + 5 * 60 * 1000 };
 
   try {
     const response = await sms.send({
@@ -63,8 +60,8 @@ app.post("/send-otp", async (req, res) => {
 // ✅ Verify OTP
 app.post("/verify-otp", (req, res) => {
   const { phoneNumber, otp } = req.body;
-
   const record = otpStore[phoneNumber];
+
   if (!record) return res.status(400).json({ error: "No OTP found" });
   if (Date.now() > record.expiresAt) return res.status(400).json({ error: "OTP expired" });
   if (record.otp.toString() !== otp.toString()) return res.status(400).json({ error: "Invalid OTP" });
@@ -80,11 +77,9 @@ app.post("/update-recycled-stats", async (req, res) => {
     const userId = after?.userId || before?.userId;
     if (!userId) return res.status(400).json({ error: "No userId found" });
 
-    const getCompletedWeight = (data) =>
-      data && data.status === "completed" ? data.weight || 0 : 0;
-
-    const beforeWeight = getCompletedWeight(before);
-    const afterWeight = getCompletedWeight(after);
+    const getWeight = (data) => (data?.status === "completed" ? data.weight || 0 : 0);
+    const beforeWeight = getWeight(before);
+    const afterWeight = getWeight(after);
     const diffWeight = afterWeight - beforeWeight;
 
     const diffPoints = diffWeight / 50;
@@ -120,7 +115,6 @@ app.post("/update-recycled-stats", async (req, res) => {
 // ✅ Withdraw endpoint
 app.post("/withdraw", async (req, res) => {
   const { userId, amount } = req.body;
-
   if (!userId || !amount || amount <= 0) {
     return res.status(400).json({ error: "Invalid data" });
   }
@@ -130,26 +124,21 @@ app.post("/withdraw", async (req, res) => {
   try {
     await admin.firestore().runTransaction(async (transaction) => {
       const userSnap = await transaction.get(userRef);
-      const balance = userSnap.data().walletBalance || 0;
+      const balance = userSnap.data()?.walletBalance || 0;
 
-      if (amount > balance) {
-        throw new Error("Insufficient balance");
-      }
+      if (amount > balance) throw new Error("Insufficient balance");
 
       transaction.update(userRef, {
         walletBalance: balance - amount,
       });
 
-      transaction.set(
-        admin.firestore().collection("wallet_transactions").doc(),
-        {
-          userId,
-          type: "Withdraw",
-          amount: -amount,
-          timestamp: admin.firestore.FieldValue.serverTimestamp(),
-          status: "completed",
-        }
-      );
+      transaction.set(admin.firestore().collection("wallet_transactions").doc(), {
+        userId,
+        type: "Withdraw",
+        amount: -amount,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        status: "completed",
+      });
     });
 
     return res.json({ success: true });
@@ -172,55 +161,35 @@ app.post("/request-completed", async (req, res) => {
     after.wasteType
   ) {
     try {
-      const userId = after.userId;
-      const weight = after.weight;
-      const wasteType = after.wasteType;
-      console.log("Processing completion for user:", userId);
+      const { userId, weight, wasteType } = after;
+      console.log("Processing for wasteType:", wasteType);
 
-      console.log("Received wasteType:", wasteType);
+      // Try exact → lowercase → uppercase
+      const variants = [wasteType, wasteType.toLowerCase(), wasteType.toUpperCase()];
+      let priceSnap = null;
 
-let priceSnap = await admin
-  .firestore()
-  .collection("waste_prices")
-  .doc(wasteType)
-  .get();
+      for (const key of variants) {
+        const snap = await admin.firestore().collection("waste_prices").doc(key).get();
+        if (snap.exists) {
+          priceSnap = snap;
+          console.log(`Found price doc for wasteType: ${key}`);
+          break;
+        }
+      }
 
-if (priceSnap.exists) {
-  console.log(`Found price doc using exact wasteType: ${wasteType}`);
-} else {
-  console.warn(`No doc for exact match. Trying lowercase fallback for: ${wasteType}`);
-  priceSnap = await admin
-    .firestore()
-    .collection("waste_prices")
-    .doc(wasteType.toLowerCase())
-    .get();
+      if (!priceSnap) {
+        console.error("❌ No price found for any casing variant.");
+        return res.status(400).json({ error: "Invalid waste type for pricing" });
+      }
 
-  if (priceSnap.exists) {
-    console.log(`Found price doc using lowercase fallback: ${wasteType.toLowerCase()}`);
-  } else {
-    console.error("No doc found for either format.");
-  }
-}
-
-const pricePerKg = priceSnap.exists
-  ? priceSnap.data().pricePerKg || 0
-  : 0;
-
-if (!pricePerKg) {
-  console.error("Final error: Invalid price per kg for wasteType:", wasteType);
-  return res.status(400).json({ error: "Invalid price per kg" });
-}
-
-
+      const pricePerKg = priceSnap.data().pricePerKg || 0;
       const amount = weight * pricePerKg;
-      console.log("Crediting amount:", amount);
 
       const userRef = admin.firestore().collection("users").doc(userId);
       await admin.firestore().runTransaction(async (transaction) => {
         const userSnap = await transaction.get(userRef);
-        if (!userSnap.exists) {
-          throw new Error("User not found");
-        }
+        if (!userSnap.exists) throw new Error("User not found");
+
         transaction.update(userRef, {
           walletBalance: admin.firestore.FieldValue.increment(amount),
           recycledWeight: admin.firestore.FieldValue.increment(weight),
@@ -228,8 +197,7 @@ if (!pricePerKg) {
           co2Saved: admin.firestore.FieldValue.increment(weight * 1.5),
         });
 
-        const walletTxRef = admin.firestore().collection("wallet_transactions").doc();
-        transaction.set(walletTxRef, {
+        transaction.set(admin.firestore().collection("wallet_transactions").doc(), {
           userId,
           type: "Recycle Credit",
           amount,
@@ -240,19 +208,18 @@ if (!pricePerKg) {
         });
       });
 
-      console.log("Transaction completed for user:", userId);
+      console.log("✅ Transaction completed for user:", userId);
       return res.json({ success: true });
     } catch (err) {
       console.error("❌ request-completed error:", err);
       return res.status(500).json({ error: err.message });
     }
   } else {
-    console.log("No update needed for request-completed");
+    console.log("ℹ️ No update needed for request-completed.");
     return res.status(200).json({ message: "No update needed." });
   }
 });
-// ✅ Start Express Server
+
+// ✅ Start server
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`🚀 Server is running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
