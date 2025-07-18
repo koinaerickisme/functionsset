@@ -2,7 +2,7 @@ const express = require("express");
 const admin = require("firebase-admin");
 const cors = require("cors");
 const Africastalking = require("africastalking");
-const Joi = require("joi");
+const { z } = require("zod");
 
 // 🔐 Load Firebase credentials safely
 let serviceAccount;
@@ -43,11 +43,16 @@ app.get("/health", (req, res) => res.json({ status: "ok" }));
 
 // ✅ Send OTP
 app.post("/send-otp", async (req, res) => {
-  const schema = Joi.object({ phoneNumber: Joi.string().required() });
-  const { error, value } = schema.validate(req.body);
-  if (error) return res.status(400).json({ error: error.details[0].message });
+  const schema = z.object({ 
+    phoneNumber: z.string().min(1, "Phone number is required")
+  });
+  
+  const validation = schema.safeParse(req.body);
+  if (!validation.success) {
+    return res.status(400).json({ error: validation.error.errors[0].message });
+  }
 
-  const { phoneNumber } = value;
+  const { phoneNumber } = validation.data;
   const otp = Math.floor(100000 + Math.random() * 900000);
   const expiresAt = Date.now() + 5 * 60 * 1000;
 
@@ -69,15 +74,17 @@ app.post("/send-otp", async (req, res) => {
 
 // ✅ Verify OTP
 app.post("/verify-otp", async (req, res) => {
-  const schema = Joi.object({
-    phoneNumber: Joi.string().required(),
-    otp: Joi.string().required(),
+  const schema = z.object({
+    phoneNumber: z.string().min(1, "Phone number is required"),
+    otp: z.string().min(1, "OTP is required"),
   });
 
-  const { error, value } = schema.validate(req.body);
-  if (error) return res.status(400).json({ error: error.details[0].message });
+  const validation = schema.safeParse(req.body);
+  if (!validation.success) {
+    return res.status(400).json({ error: validation.error.errors[0].message });
+  }
 
-  const { phoneNumber, otp } = value;
+  const { phoneNumber, otp } = validation.data;
 
   try {
     const doc = await otpRef.doc(phoneNumber).get();
@@ -97,15 +104,17 @@ app.post("/verify-otp", async (req, res) => {
 
 // ✅ Withdraw funds
 app.post("/withdraw", async (req, res) => {
-  const schema = Joi.object({
-    userId: Joi.string().required(),
-    amount: Joi.number().positive().required(),
+  const schema = z.object({
+    userId: z.string().min(1, "User ID is required"),
+    amount: z.number().positive("Amount must be positive"),
   });
 
-  const { error, value } = schema.validate(req.body);
-  if (error) return res.status(400).json({ error: error.details[0].message });
+  const validation = schema.safeParse(req.body);
+  if (!validation.success) {
+    return res.status(400).json({ error: validation.error.errors[0].message });
+  }
 
-  const { userId, amount } = value;
+  const { userId, amount } = validation.data;
   const userRef = usersRef.doc(userId);
 
   try {
