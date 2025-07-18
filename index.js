@@ -177,20 +177,30 @@ app.post("/request-completed", async (req, res) => {
       const wasteType = after.wasteType;
       console.log("Processing completion for user:", userId);
 
-      const priceSnap = await admin
-        .firestore()
-        .collection("waste_prices")
-        .doc(wasteType)
-        .get();
+      let priceSnap = await admin
+  .firestore()
+  .collection("waste_prices")
+  .doc(wasteType)
+  .get();
 
-      const pricePerKg = priceSnap.exists
-        ? priceSnap.data().pricePerKg || 0
-        : 0;
+if (!priceSnap.exists) {
+  console.warn(`Fallback: trying lowercased doc for ${wasteType}`);
+  priceSnap = await admin
+    .firestore()
+    .collection("waste_prices")
+    .doc(wasteType.toLowerCase())
+    .get();
+}
 
-      if (!pricePerKg) {
-        console.log("Invalid price per kg for wasteType:", wasteType);
-        return res.status(400).json({ error: "Invalid price per kg" });
-      }
+const pricePerKg = priceSnap.exists
+  ? priceSnap.data().pricePerKg || 0
+  : 0;
+
+if (!pricePerKg) {
+  console.error("Invalid price per kg for wasteType:", wasteType);
+  return res.status(400).json({ error: "Invalid price per kg" });
+}
+
 
       const amount = weight * pricePerKg;
       console.log("Crediting amount:", amount);
