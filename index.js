@@ -177,19 +177,29 @@ app.post("/request-completed", async (req, res) => {
       const wasteType = after.wasteType;
       console.log("Processing completion for user:", userId);
 
-      let priceSnap = await admin
+      console.log("Received wasteType:", wasteType);
+
+let priceSnap = await admin
   .firestore()
   .collection("waste_prices")
   .doc(wasteType)
   .get();
 
-if (!priceSnap.exists) {
-  console.warn(`Fallback: trying lowercased doc for ${wasteType}`);
+if (priceSnap.exists) {
+  console.log(`Found price doc using exact wasteType: ${wasteType}`);
+} else {
+  console.warn(`No doc for exact match. Trying lowercase fallback for: ${wasteType}`);
   priceSnap = await admin
     .firestore()
     .collection("waste_prices")
     .doc(wasteType.toLowerCase())
     .get();
+
+  if (priceSnap.exists) {
+    console.log(`Found price doc using lowercase fallback: ${wasteType.toLowerCase()}`);
+  } else {
+    console.error("No doc found for either format.");
+  }
 }
 
 const pricePerKg = priceSnap.exists
@@ -197,7 +207,7 @@ const pricePerKg = priceSnap.exists
   : 0;
 
 if (!pricePerKg) {
-  console.error("Invalid price per kg for wasteType:", wasteType);
+  console.error("Final error: Invalid price per kg for wasteType:", wasteType);
   return res.status(400).json({ error: "Invalid price per kg" });
 }
 
