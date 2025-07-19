@@ -46,7 +46,7 @@ app.post("/send-otp", async (req, res) => {
   const schema = z.object({ 
     phoneNumber: z.string().min(1, "Phone number is required")
   });
-  
+
   const validation = schema.safeParse(req.body);
   if (!validation.success) {
     return res.status(400).json({ error: validation.error.errors[0].message });
@@ -102,7 +102,7 @@ app.post("/verify-otp", async (req, res) => {
   }
 });
 
-// ✅ Withdraw funds
+// ✅ Withdraw funds (web/admin)
 app.post("/withdraw", async (req, res) => {
   const schema = z.object({
     userId: z.string().min(1, "User ID is required"),
@@ -145,18 +145,63 @@ app.post("/withdraw", async (req, res) => {
   }
 });
 
+// ✅ B2C Withdraw for Flutter App
+app.post("/b2c", async (req, res) => {
+  const schema = z.object({
+    user_id: z.string().min(1, "User ID is required"),
+    phone: z.string().min(10, "Phone is required"),
+    amount: z.number().positive("Amount must be positive"),
+  });
+
+  const validation = schema.safeParse(req.body);
+  if (!validation.success) {
+    return res.status(400).json({ error: validation.error.errors[0].message });
+  }
+
+  const { user_id, phone, amount } = validation.data;
+  const userRef = usersRef.doc(user_id);
+
+  try {
+    await db.runTransaction(async (transaction) => {
+      const userSnap = await transaction.get(userRef);
+      if (!userSnap.exists) throw new Error("User not found");
+
+      const balance = userSnap.data().walletBalance || 0;
+      if (amount > balance) throw new Error("Insufficient balance");
+
+      transaction.update(userRef, {
+        walletBalance: balance - amount,
+      });
+
+      transaction.set(walletRef.doc(), {
+        userId: user_id,
+        type: "Withdraw",
+        amount: -amount,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        status: "completed",
+        method: "B2C",
+        phone,
+      });
+    });
+
+    return res.json({ success: true, message: "Withdrawal processed and wallet updated." });
+  } catch (err) {
+    console.error("❌ /b2c error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // 🔤 Normalize waste type string
 function normalizeWasteType(str) {
   if (!str || typeof str !== "string") return "";
   let formatted = str.trim().charAt(0).toUpperCase() + str.trim().slice(1).toLowerCase();
-  // Ensure it ends with 's' for plural
   if (!formatted.endsWith('s')) {
     formatted += 's';
   }
   return formatted;
 }
 
-// ✅ Request completed & credit user
+// ✅ Handle request-completed callback
 app.post("/request-completed", async (req, res) => {
   const { before, after, requestId } = req.body;
 
@@ -180,7 +225,6 @@ app.post("/request-completed", async (req, res) => {
       }
 
       const priceDocSnap = await wastePricesRef.doc(normalizedWasteType).get();
-
       if (!priceDocSnap.exists) {
         return res.status(400).json({ error: `Waste price not found for type '${normalizedWasteType}'` });
       }
