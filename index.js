@@ -172,9 +172,12 @@ app.post("/b2c/result", async (req, res) => {
 
       transactions.forEach(async (doc) => {
         const tx = doc.data();
+        // Ensure both are numbers for comparison
+        const txAmount = Number(tx.amount);
+        const callbackAmount = -Math.abs(Number(data.amount));
         if (
           tx.userId === data.user_id &&
-          tx.amount === -Math.abs(data.amount)
+          txAmount === callbackAmount
         ) {
           await doc.ref.update({
             status: "completed",
