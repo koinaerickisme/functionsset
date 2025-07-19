@@ -230,57 +230,104 @@ app.post("/b2c", async (req, res) => {
 
 app.post("/b2c/result", async (req, res) => {
   try {
-    const data = req.body;
-    console.log("📩 B2C Callback Received:", JSON.stringify(data, null, 2));
+    console.log("📩 B2C Callback Received");
+    const result = req.body.Result;
 
-    await db.collection("b2c_results").add({
-      receivedAt: admin.firestore.FieldValue.serverTimestamp(),
-      result: data,
-    });
-
-    const result = data.mpesa_response;
-    if (result && result.OriginatorConversationID) {
-      console.log(`🔍 Processing B2C callback for transaction ${result.OriginatorConversationID}`);
-
-      const transactions = await walletRef
-        .where("status", "==", "pending")
-        .where("method", "==", "B2C")
-        .get();
-
-      let processed = false;
-      transactions.forEach(async (doc) => {
-        const tx = doc.data();
-        const txAmount = Number(tx.amount);
-        const callbackAmount = -Math.abs(Number(data.amount));
-        
-        console.log(`🔎 Comparing transaction ${doc.id}:`, {
-          txUserId: tx.userId,
-          reqUserId: data.user_id,
-          txAmount,
-          callbackAmount
-        });
-
-        if (tx.userId === data.user_id && txAmount === callbackAmount) {
-          console.log(`✅ Matching transaction found: ${doc.id}`);
-          await doc.ref.update({
-            status: "completed",
-            mpesaMeta: result,
-          });
-          processed = true;
-        }
-      });
-
-      if (!processed) {
-        console.log("⚠️ No matching transaction found for callback");
-      }
-    } else {
-      console.log("❗ Callback missing required MPESA response data");
+    if (!result || !result.ResultParameters) {
+      console.warn("⚠️ Malformed B2C callback");
+      return res.status(400).send("Missing result data");
     }
 
-    res.status(200).send("OK");
-  } catch (err) {
-    console.error("❌ B2C callback processing failed:", err);
-    res.status(500).send("Failed to process");
+    const params = result.ResultParameters.ResultParameter;
+    const phoneParam = params.find(p => p.Key === "ReceiverPartyPublicName");
+    const amountParam = params.find(p => p.Key === "TransactionAmount");
+
+    if (!phoneParam || !amountParam) {
+      console.warn("⚠️ Missing necessary parameters in B2C callback");
+      return res.status(400).send("Missing necessary parameters");
+    }
+
+    const phoneNumber = phoneParam.Value.replace(/^tel:/, "");
+    const callbackAmount = parseFloat(amountParam.Value);
+    const resultCode = result.ResultCode;
+
+    const transactionsRef = db.collection("wallet_transactions");
+    const usersRef = db.collection("users");
+    const snapshot = await transactionsRef
+      .where("type", "==", "Withdraw")
+      .where("status", "==", "pending")
+      .where("phone", "==", phoneNumber)
+      .get();
+
+    if (snapshot.empty) {
+      console.log("🚫 No matching pending transaction found for phone:", phoneNumber);
+      return res.status(200).send("No matching transaction found");
+    }
+
+    let processed = false;
+
+    for (const doc of snapshot.docs) {
+      const tx = doc.data();
+      const txAmount = Math.abs(tx.amount);
+
+      if (txAmount === callbackAmount) {
+        console.log(`✅ Matching transaction found: ${doc.id}`);
+
+        const isSuccess = resultCode === 0;
+        const userRef = usersRef.doc(tx.userId);
+
+        await db.runTransaction(async (t) => {
+          if (isSuccess) {
+            // Success: Just mark as completed
+            t.update(doc.ref, {
+              status: "completed",
+              mpesaMeta: result,
+            });
+          } else {
+            // Failure: Refund the wallet
+            const userSnap = await t.get(userRef);
+            const currentBalance = userSnap.data().walletBalance || 0;
+            const refundAmount = Math.abs(tx.amount); // tx.amount is negative
+
+            t.update(userRef, {
+              walletBalance: currentBalance + refundAmount,
+            });
+
+            t.update(doc.ref, {
+              status: "failed",
+              mpesaMeta: result,
+            });
+
+            // Log refund
+            const refundLogRef = db.collection("wallet_transactions").doc();
+            t.set(refundLogRef, {
+              userId: tx.userId,
+              type: "Refund",
+              amount: refundAmount,
+              relatedTo: doc.id,
+              phone: phoneNumber,
+              timestamp: admin.firestore.FieldValue.serverTimestamp(),
+              status: "completed",
+              reason: "M-Pesa B2C failed",
+            });
+
+            console.log(`💸 Refunded ${refundAmount} to user ${tx.userId}`);
+          }
+        });
+
+        processed = true;
+        break; // Exit after first match
+      }
+    }
+
+    if (!processed) {
+      console.log("❌ No matching transaction amount found");
+    }
+
+    return res.status(200).send("B2C result processed");
+  } catch (error) {
+    console.error("❌ Error processing B2C result:", error);
+    return res.status(500).send("Internal server error");
   }
 });
 
