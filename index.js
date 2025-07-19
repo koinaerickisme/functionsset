@@ -4,7 +4,6 @@ const cors = require("cors");
 const Africastalking = require("africastalking");
 const { z } = require("zod");
 
-// 🔐 Load Firebase credentials
 let serviceAccount;
 try {
   serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
@@ -13,10 +12,8 @@ try {
   process.exit(1);
 }
 
-// 🔐 Firebase Admin Init
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
-// 🔁 Firestore refs
 const db = admin.firestore();
 const usersRef = db.collection("users");
 const otpRef = db.collection("otp_verifications");
@@ -24,22 +21,18 @@ const walletRef = db.collection("wallet_transactions");
 const wastePricesRef = db.collection("waste_prices");
 const processedRequestsRef = db.collection("processed_requests");
 
-// 🌍 Africa's Talking setup
 const africastalking = Africastalking({
   apiKey: process.env.AT_API_KEY,
   username: process.env.AT_USERNAME || "mementmori",
 });
 const sms = africastalking.SMS;
 
-// 🚀 Express setup
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ✅ Health check
 app.get("/health", (_, res) => res.json({ status: "ok" }));
 
-// ✅ Send OTP
 app.post("/send-otp", async (req, res) => {
   const schema = z.object({ phoneNumber: z.string().min(10) });
   const parsed = schema.safeParse(req.body);
@@ -63,7 +56,6 @@ app.post("/send-otp", async (req, res) => {
   }
 });
 
-// ✅ Verify OTP
 app.post("/verify-otp", async (req, res) => {
   const schema = z.object({
     phoneNumber: z.string(),
@@ -73,7 +65,6 @@ app.post("/verify-otp", async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: parsed.error.errors[0].message });
 
   const { phoneNumber, otp } = parsed.data;
-
   try {
     const doc = await otpRef.doc(phoneNumber).get();
     if (!doc.exists) return res.status(400).json({ error: "No OTP found" });
@@ -89,7 +80,6 @@ app.post("/verify-otp", async (req, res) => {
   }
 });
 
-// ✅ Withdraw (admin/web)
 app.post("/withdraw", async (req, res) => {
   const schema = z.object({
     userId: z.string(),
@@ -125,7 +115,6 @@ app.post("/withdraw", async (req, res) => {
   }
 });
 
-// ✅ Flutter B2C Withdraw
 app.post("/b2c", async (req, res) => {
   const schema = z.object({
     user_id: z.string(),
@@ -147,7 +136,6 @@ app.post("/b2c", async (req, res) => {
       if (amount > balance) throw new Error("Insufficient balance");
 
       tx.update(userRef, { walletBalance: balance - amount });
-
       tx.set(walletRef.doc(), {
         userId: user_id,
         type: "Withdraw",
@@ -165,7 +153,6 @@ app.post("/b2c", async (req, res) => {
   }
 });
 
-// ✅ B2C MPESA Callback
 app.post("/b2c/result", async (req, res) => {
   try {
     const data = req.body;
@@ -176,7 +163,27 @@ app.post("/b2c/result", async (req, res) => {
       result: data,
     });
 
-    // You can update wallet transaction status here if needed (e.g., find by OriginatorConversationID)
+    const result = data.mpesa_response;
+    if (result && result.OriginatorConversationID) {
+      const transactions = await walletRef
+        .where("status", "==", "pending")
+        .where("method", "==", "B2C")
+        .get();
+
+      transactions.forEach(async (doc) => {
+        const tx = doc.data();
+        if (
+          tx.userId === data.user_id &&
+          tx.amount === -Math.abs(data.amount)
+        ) {
+          await doc.ref.update({
+            status: "completed",
+            mpesaMeta: result,
+          });
+        }
+      });
+    }
+
     res.status(200).send("OK");
   } catch (err) {
     console.error("❌ B2C callback error:", err);
@@ -184,7 +191,6 @@ app.post("/b2c/result", async (req, res) => {
   }
 });
 
-// 🔤 Normalize waste type
 function normalizeWasteType(str) {
   if (!str || typeof str !== "string") return "";
   let formatted = str.trim().charAt(0).toUpperCase() + str.trim().slice(1).toLowerCase();
@@ -192,7 +198,6 @@ function normalizeWasteType(str) {
   return formatted;
 }
 
-// ✅ Waste pickup complete
 app.post("/request-completed", async (req, res) => {
   const { before, after, requestId } = req.body;
 
@@ -253,7 +258,6 @@ app.post("/request-completed", async (req, res) => {
   }
 });
 
-// ✅ Server start
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
