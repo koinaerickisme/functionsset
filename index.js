@@ -22,12 +22,6 @@ const walletRef = db.collection("wallet_transactions");
 const wastePricesRef = db.collection("waste_prices");
 const processedRequestsRef = db.collection("processed_requests");
 
-const africastalking = Africastalking({
-  apiKey: process.env.AT_API_KEY,
-  username: process.env.AT_USERNAME || "mementmori",
-});
-const sms = africastalking.SMS;
-
 const app = express();
 app.use(cors());
 app.use(express.json());
