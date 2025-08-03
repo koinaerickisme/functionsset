@@ -2,9 +2,9 @@ const axios = require('axios');
 
 class SmsService {
   constructor() {
-    this.apiKey = "9981bb72e1a2e1ec8ae529c7783abe06";
-    this.partnerId = "14125";
-    this.shortcode = "BLANCOSY";
+    this.apiKey = process.env.FASTMESSAGE_API_KEY;
+    this.partnerId = process.env.FASTMESSAGE_PARTNER_ID;
+    this.shortcode = process.env.FASTMESSAGE_SHORTCODE;
     this.baseUrl = "https://sms.fastmessage.co.ke/api/services/sendsms";
   }
 
