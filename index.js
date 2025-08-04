@@ -43,6 +43,47 @@ function normalizeKenyanNumber(input) {
   return number;
 }
 
+// Check verification status endpoint
+app.post("/check-verification", async (req, res) => {
+  try {
+    const schema = z.object({
+      phoneNumber: z.string().min(10),
+    });
+    
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.errors[0].message });
+    }
+    
+    const { phoneNumber } = parsed.data;
+    const normalizedPhone = normalizeKenyanNumber(phoneNumber);
+    
+    // Check if user exists and is verified
+    const userQuery = await usersRef.where("phoneNumber", "==", normalizedPhone).limit(1).get();
+    
+    if (userQuery.empty) {
+      return res.json({ 
+        verified: false, 
+        message: "Phone number not found. Please verify your number first." 
+      });
+    }
+    
+    const userData = userQuery.docs[0].data();
+    const isVerified = userData.phoneVerified === true;
+    
+    return res.json({
+      verified: isVerified,
+      phoneNumber: normalizedPhone,
+      userId: userQuery.docs[0].id,
+      message: isVerified ? "Phone number is verified" : "Please verify your number first"
+    });
+    
+  } catch (err) {
+    console.error("❌ Check Verification Error:", err);
+    return res.status(500).json({ error: "Failed to check verification status", details: err.message });
+  }
+});
+
 // OTP endpoints
 app.post("/send-otp", async (req, res) => {
   try {
@@ -137,11 +178,40 @@ app.post("/verify-otp", async (req, res) => {
       return res.status(400).json({ error: "Invalid OTP" });
     }
     
-    // OTP is valid - delete the document and return success
+    // OTP is valid - update user verification status and delete OTP document
     await docRef.delete();
     console.log(`✅ OTP verified successfully for ${normalizedPhone}`);
     
-    return res.json({ success: true, message: "OTP verified successfully" });
+    // Update or create user document to mark phone as verified
+    const userQuery = await usersRef.where("phoneNumber", "==", normalizedPhone).limit(1).get();
+    
+    if (!userQuery.empty) {
+      // Update existing user
+      const userDoc = userQuery.docs[0];
+      await userDoc.ref.update({
+        phoneVerified: true,
+        phoneNumber: normalizedPhone,
+        lastVerified: admin.firestore.FieldValue.serverTimestamp()
+      });
+      console.log(`📱 Updated verification status for existing user: ${userDoc.id}`);
+    } else {
+      // Create new user document if doesn't exist
+      const newUserRef = await usersRef.add({
+        phoneNumber: normalizedPhone,
+        phoneVerified: true,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastVerified: admin.firestore.FieldValue.serverTimestamp(),
+        walletBalance: 0
+      });
+      console.log(`👤 Created new verified user: ${newUserRef.id}`);
+    }
+    
+    return res.json({ 
+      success: true, 
+      message: "OTP verified successfully",
+      phoneVerified: true,
+      phoneNumber: normalizedPhone
+    });
     
   } catch (err) {
     console.error("❌ Verify OTP Error:", err);
