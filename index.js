@@ -207,7 +207,8 @@ app.post("/verify-otp", async (req, res) => {
     }
     
     return res.json({ 
-      success: true, 
+      success: true,
+      verified: true, // Add this for Flutter compatibility
       message: "OTP verified successfully",
       phoneVerified: true,
       phoneNumber: normalizedPhone
