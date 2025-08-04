@@ -3,7 +3,7 @@ const admin = require("firebase-admin");
 const cors = require("cors");
 const { z } = require("zod");
 const fetch = require("node-fetch"); // For calling Python payout service
-const {smsService} = require("./sms");
+const { smsService } = require("./sms");
 
 let serviceAccount;
 try {
@@ -33,6 +33,16 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "Internal server error" });
 });
 
+// --- Phone Number Normalization ---
+function normalizeKenyanNumber(input) {
+  let number = String(input).trim().replace(/\s+/g, "");
+  if (number.startsWith("+")) number = number.substring(1);
+  if (number.startsWith("254") && number.length === 12) return number;
+  if (number.startsWith("0") && number.length === 10) return "254" + number.substring(1);
+  if ((number.startsWith("7") || number.startsWith("1")) && number.length === 9) return "254" + number;
+  return number;
+}
+
 // OTP endpoints
 app.post("/send-otp", async (req, res) => {
   try {
@@ -41,13 +51,28 @@ app.post("/send-otp", async (req, res) => {
     if (!parsed.success) {
       return res.status(400).json({ error: parsed.error.errors[0].message });
     }
+    
     const { phoneNumber } = parsed.data;
+    const normalizedPhone = normalizeKenyanNumber(phoneNumber);
     const otp = Math.floor(100000 + Math.random() * 900000);
-    const expiresAt = Date.now() + 5 * 60 * 1000;
-    await otpRef.doc(phoneNumber).set({ otp, expiresAt });
-    const response = await smsService.sendSms(phoneNumber, `Your verification code is ${otp}`);
+    const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes expiry
+    
+    // Use phone number as document ID to ensure proper retrieval
+    await otpRef.doc(normalizedPhone).set({
+      phoneNumber: normalizedPhone,
+      otp: otp.toString(), // Store as string for consistent comparison
+      expiresAt,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      attempts: 0 // Track verification attempts
+    });
+    
+    // Send OTP via SMS
+    const response = await smsService.sendSms(normalizedPhone, `Your verification code is ${otp}`);
+    console.log(`📱 OTP ${otp} sent to ${normalizedPhone}`);
+    
     return res.json({ success: true, message: "OTP sent", response });
   } catch (err) {
+    console.error("❌ Send OTP Error:", err);
     return res.status(500).json({ error: "Failed to send OTP", details: err.message });
   }
 });
@@ -55,21 +80,72 @@ app.post("/send-otp", async (req, res) => {
 app.post("/verify-otp", async (req, res) => {
   try {
     const schema = z.object({
-      phoneNumber: z.string(),
-      otp: z.string(),
+      phoneNumber: z.string().min(10),
+      otp: z.string().min(6).max(6),
     });
+    
     const parsed = schema.safeParse(req.body);
-    if (!parsed.success) return res.status(400).json({ error: parsed.error.errors[0].message });
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.errors[0].message });
+    }
+    
     const { phoneNumber, otp } = parsed.data;
-    const doc = await otpRef.doc(phoneNumber).get();
-    if (!doc.exists) return res.status(400).json({ error: "No OTP found" });
+    const normalizedPhone = normalizeKenyanNumber(phoneNumber);
+    
+    console.log(`🔍 Verifying OTP for ${normalizedPhone}`);
+    
+    // Get OTP document using phone number as document ID
+    const docRef = otpRef.doc(normalizedPhone);
+    const doc = await docRef.get();
+    
+    if (!doc.exists) {
+      console.log(`❌ No OTP document found for ${normalizedPhone}`);
+      return res.status(400).json({ error: "No OTP found" });
+    }
+    
     const data = doc.data();
-    if (Date.now() > data.expiresAt) return res.status(400).json({ error: "OTP expired" });
-    if (data.otp.toString() !== otp.toString()) return res.status(400).json({ error: "Invalid OTP" });
-    await otpRef.doc(phoneNumber).delete();
-    return res.json({ success: true });
+    console.log(`📋 Found OTP data:`, { 
+      storedOTP: data.otp, 
+      receivedOTP: otp, 
+      expiresAt: new Date(data.expiresAt),
+      attempts: data.attempts 
+    });
+    
+    // Check for too many attempts (rate limiting)
+    if (data.attempts >= 3) {
+      await docRef.delete();
+      return res.status(400).json({ error: "Too many failed attempts. Please request a new OTP." });
+    }
+    
+    // Check expiration
+    if (Date.now() > data.expiresAt) {
+      await docRef.delete();
+      console.log(`⏰ OTP expired for ${normalizedPhone}`);
+      return res.status(400).json({ error: "OTP expired" });
+    }
+    
+    // Verify OTP (ensure both are strings for comparison)
+    const storedOTP = data.otp.toString().trim();
+    const providedOTP = otp.toString().trim();
+    
+    if (storedOTP !== providedOTP) {
+      // Increment failed attempts
+      await docRef.update({
+        attempts: admin.firestore.FieldValue.increment(1)
+      });
+      console.log(`❌ Invalid OTP for ${normalizedPhone}. Expected: ${storedOTP}, Got: ${providedOTP}`);
+      return res.status(400).json({ error: "Invalid OTP" });
+    }
+    
+    // OTP is valid - delete the document and return success
+    await docRef.delete();
+    console.log(`✅ OTP verified successfully for ${normalizedPhone}`);
+    
+    return res.json({ success: true, message: "OTP verified successfully" });
+    
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    console.error("❌ Verify OTP Error:", err);
+    return res.status(500).json({ error: "Verification failed", details: err.message });
   }
 });
 
@@ -119,6 +195,7 @@ app.post("/b2c", async (req, res) => {
       return res.status(400).json({ error: parsed.error.errors[0].message });
     }
     const { user_id, phone, amount } = parsed.data;
+    const normalizedPhone = normalizeKenyanNumber(phone);
     const userRef = usersRef.doc(user_id);
     await db.runTransaction(async (tx) => {
       const userSnap = await tx.get(userRef);
@@ -133,7 +210,7 @@ app.post("/b2c", async (req, res) => {
         timestamp: admin.firestore.FieldValue.serverTimestamp(),
         status: "pending",
         method: "B2C",
-        phone,
+        phone: normalizedPhone,
       });
     });
     // Call Python payout service after wallet deduction
@@ -144,7 +221,7 @@ app.post("/b2c", async (req, res) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           user_id,
-          phone,
+          phone: normalizedPhone,
           amount
         }),
       });
@@ -297,6 +374,26 @@ function normalizeWasteType(str) {
   if (!formatted.endsWith("s")) formatted += "s";
   return formatted;
 }
+
+// Utility endpoint to clean up expired OTPs (optional - run periodically)
+app.post("/cleanup-expired-otps", async (req, res) => {
+  try {
+    const now = Date.now();
+    const expiredQuery = await otpRef.where("expiresAt", "<", now).get();
+    
+    const batch = db.batch();
+    expiredQuery.docs.forEach(doc => {
+      batch.delete(doc.ref);
+    });
+    
+    await batch.commit();
+    console.log(`🧹 Cleaned up ${expiredQuery.size} expired OTPs`);
+    
+    return res.json({ success: true, cleaned: expiredQuery.size });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
