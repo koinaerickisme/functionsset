@@ -5,6 +5,46 @@ const { z } = require("zod");
 const fetch = require("node-fetch"); // For calling Python payout service
 const { smsService } = require("./sms");
 
+// Add request logging middleware
+const requestLogger = (req, res, next) => {
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] ${req.method} ${req.path} - ${req.ip}`);
+  next();
+};
+
+// Simple rate limiting for OTP endpoints
+const rateLimitMap = new Map();
+const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
+const RATE_LIMIT_MAX_REQUESTS = 5; // 5 requests per minute
+
+const rateLimit = (req, res, next) => {
+  const ip = req.ip || req.connection.remoteAddress;
+  const now = Date.now();
+  
+  if (!rateLimitMap.has(ip)) {
+    rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
+    return next();
+  }
+  
+  const rateLimitData = rateLimitMap.get(ip);
+  
+  if (now > rateLimitData.resetTime) {
+    rateLimitData.count = 1;
+    rateLimitData.resetTime = now + RATE_LIMIT_WINDOW;
+    return next();
+  }
+  
+  if (rateLimitData.count >= RATE_LIMIT_MAX_REQUESTS) {
+    return res.status(429).json({ 
+      error: "Too many requests. Please try again later.",
+      retryAfter: Math.ceil((rateLimitData.resetTime - now) / 1000)
+    });
+  }
+  
+  rateLimitData.count++;
+  next();
+};
+
 let serviceAccount;
 try {
   serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
@@ -17,6 +57,7 @@ admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
 const db = admin.firestore();
 const usersRef = db.collection("users");
+const phoneNumbersRef = db.collection("phone_numbers");
 const otpRef = db.collection("otp_verifications");
 const walletRef = db.collection("wallet_transactions");
 const wastePricesRef = db.collection("waste_prices");
@@ -25,8 +66,78 @@ const processedRequestsRef = db.collection("processed_requests");
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(requestLogger);
 
-app.get("/health", (_, res) => res.json({ status: "ok" }));
+app.get("/health", (_, res) => res.json({ 
+  status: "ok", 
+  timestamp: new Date().toISOString(),
+  service: "functions-service",
+  version: "1.0.0"
+}));
+
+// 📊 Analytics Endpoints
+app.get("/analytics/users", async (req, res) => {
+  try {
+    const usersSnapshot = await usersRef.get();
+    const totalUsers = usersSnapshot.size;
+    
+    let verifiedUsers = 0;
+    let totalWalletBalance = 0;
+    let totalRecycledWeight = 0;
+    
+    usersSnapshot.forEach(doc => {
+      const data = doc.data();
+      if (data.phoneVerified) verifiedUsers++;
+      if (data.walletBalance) totalWalletBalance += data.walletBalance;
+      if (data.recycledWeight) totalRecycledWeight += data.recycledWeight;
+    });
+    
+    res.json({
+      total_users: totalUsers,
+      verified_users: verifiedUsers,
+      verification_rate: totalUsers > 0 ? (verifiedUsers / totalUsers * 100).toFixed(2) : 0,
+      total_wallet_balance: totalWalletBalance,
+      total_recycled_weight: totalRecycledWeight,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error("Analytics error:", err);
+    res.status(500).json({ error: "Failed to fetch user analytics" });
+  }
+});
+
+app.get("/analytics/transactions", async (req, res) => {
+  try {
+    const transactionsSnapshot = await walletRef.get();
+    const totalTransactions = transactionsSnapshot.size;
+    
+    let totalAmount = 0;
+    const typeCounts = {};
+    const statusCounts = {};
+    
+    transactionsSnapshot.forEach(doc => {
+      const data = doc.data();
+      if (data.amount) totalAmount += Math.abs(data.amount);
+      
+      const type = data.type || 'unknown';
+      typeCounts[type] = (typeCounts[type] || 0) + 1;
+      
+      const status = data.status || 'unknown';
+      statusCounts[status] = (statusCounts[status] || 0) + 1;
+    });
+    
+    res.json({
+      total_transactions: totalTransactions,
+      total_amount: totalAmount,
+      type_breakdown: typeCounts,
+      status_breakdown: statusCounts,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error("Analytics error:", err);
+    res.status(500).json({ error: "Failed to fetch transaction analytics" });
+  }
+});
 
 app.use((err, req, res, next) => {
   console.error("🔥 Server Error:", err.stack);
@@ -84,8 +195,8 @@ app.post("/check-verification", async (req, res) => {
   }
 });
 
-// OTP endpoints
-app.post("/send-otp", async (req, res) => {
+// OTP endpoints with rate limiting
+app.post("/send-otp", rateLimit, async (req, res) => {
   try {
     const schema = z.object({ phoneNumber: z.string().min(10) });
     const parsed = schema.safeParse(req.body);
@@ -118,11 +229,12 @@ app.post("/send-otp", async (req, res) => {
   }
 });
 
-app.post("/verify-otp", async (req, res) => {
+app.post("/verify-otp", rateLimit, async (req, res) => {
   try {
     const schema = z.object({
       phoneNumber: z.string().min(10),
       otp: z.string().min(6).max(6),
+      userId: z.string().optional(),
     });
     
     const parsed = schema.safeParse(req.body);
@@ -130,7 +242,7 @@ app.post("/verify-otp", async (req, res) => {
       return res.status(400).json({ error: parsed.error.errors[0].message });
     }
     
-    const { phoneNumber, otp } = parsed.data;
+    const { phoneNumber, otp, userId } = parsed.data;
     const normalizedPhone = normalizeKenyanNumber(phoneNumber);
     
     console.log(`🔍 Verifying OTP for ${normalizedPhone}`);
@@ -182,28 +294,30 @@ app.post("/verify-otp", async (req, res) => {
     await docRef.delete();
     console.log(`✅ OTP verified successfully for ${normalizedPhone}`);
     
-    // Update or create user document to mark phone as verified
-    const userQuery = await usersRef.where("phoneNumber", "==", normalizedPhone).limit(1).get();
-    
-    if (!userQuery.empty) {
-      // Update existing user
-      const userDoc = userQuery.docs[0];
-      await userDoc.ref.update({
-        phoneVerified: true,
-        phoneNumber: normalizedPhone,
-        lastVerified: admin.firestore.FieldValue.serverTimestamp()
+    // If a specific userId is provided, bind phone to that user with uniqueness
+    if (userId) {
+      await db.runTransaction(async (tx) => {
+        const mapRef = phoneNumbersRef.doc(normalizedPhone);
+        const mapSnap = await tx.get(mapRef);
+        if (mapSnap.exists && mapSnap.data().ownerUid && mapSnap.data().ownerUid !== userId) {
+          throw new Error("Phone number already in use");
+        }
+        tx.set(mapRef, {
+          ownerUid: userId,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+
+        const userRef = usersRef.doc(userId);
+        tx.set(userRef, {
+          phoneNumber: normalizedPhone,
+          phoneVerified: true,
+          lastVerified: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
       });
-      console.log(`📱 Updated verification status for existing user: ${userDoc.id}`);
+      console.log(`🔒 Bound phone ${normalizedPhone} to user ${userId}`);
     } else {
-      // Create new user document if doesn't exist
-      const newUserRef = await usersRef.add({
-        phoneNumber: normalizedPhone,
-        phoneVerified: true,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        lastVerified: admin.firestore.FieldValue.serverTimestamp(),
-        walletBalance: 0
-      });
-      console.log(`👤 Created new verified user: ${newUserRef.id}`);
+      // No userId context; only return verified=true so client can bind securely later
+      console.log("⚠️ No userId provided during verify-otp; skipping binding.");
     }
     
     return res.json({ 
@@ -217,6 +331,44 @@ app.post("/verify-otp", async (req, res) => {
   } catch (err) {
     console.error("❌ Verify OTP Error:", err);
     return res.status(500).json({ error: "Verification failed", details: err.message });
+  }
+});
+
+// Reserve (bind) a phone number to a user atomically and uniquely
+app.post("/reserve-phone", async (req, res) => {
+  try {
+    const schema = z.object({
+      userId: z.string(),
+      phoneNumber: z.string().min(10),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.errors[0].message });
+    }
+    const { userId, phoneNumber } = parsed.data;
+    const normalizedPhone = normalizeKenyanNumber(phoneNumber);
+
+    await db.runTransaction(async (tx) => {
+      const mapRef = phoneNumbersRef.doc(normalizedPhone);
+      const mapSnap = await tx.get(mapRef);
+      if (mapSnap.exists && mapSnap.data().ownerUid && mapSnap.data().ownerUid !== userId) {
+        throw new Error("Phone number already in use");
+      }
+      tx.set(mapRef, {
+        ownerUid: userId,
+        reservedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+
+      const userRef = usersRef.doc(userId);
+      tx.set(userRef, {
+        phoneNumber: normalizedPhone,
+      }, { merge: true });
+    });
+
+    return res.json({ success: true, phoneNumber: normalizedPhone });
+  } catch (err) {
+    const code = /already in use/i.test(err.message) ? 409 : 500;
+    return res.status(code).json({ error: err.message });
   }
 });
 
