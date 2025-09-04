@@ -75,6 +75,34 @@ app.get("/health", (_, res) => res.json({
   version: "1.0.0"
 }));
 
+// --- Auth middleware (verifies Firebase ID token in Authorization: Bearer <token>) ---
+async function requireAuth(req, res, next) {
+  try {
+    const header = req.headers.authorization || "";
+    const m = header.match(/^Bearer\s+(.*)$/i);
+    if (!m) return res.status(401).json({ error: "Missing Bearer token" });
+    const decoded = await admin.auth().verifyIdToken(m[1]);
+    req.user = decoded; // includes uid
+    return next();
+  } catch (e) {
+    return res.status(401).json({ error: "Invalid token", details: e.message });
+  }
+}
+
+async function assertAdmin(req, res, next) {
+  try {
+    if (!req.user || !req.user.uid) return res.status(401).json({ error: "Unauthenticated" });
+    // Prefer custom claim
+    if (req.user.admin === true) return next();
+    // Fallback to Firestore role
+    const snap = await usersRef.doc(req.user.uid).get();
+    if (snap.exists && snap.data().role === 'admin') return next();
+    return res.status(403).json({ error: 'Admin only' });
+  } catch (e) {
+    return res.status(500).json({ error: 'Role check failed', details: e.message });
+  }
+}
+
 // --- Push Notifications Helpers ---
 async function sendToUserToken(userId, notification, data = {}) {
   try {
@@ -329,7 +357,7 @@ app.get("/transactions/export", async (req, res) => {
 });
 
 // Notify admins when a new recycling request is created (called from client)
-app.post("/request-created", async (req, res) => {
+app.post("/request-created", requireAuth, async (req, res) => {
   try {
     const { userId, requestId, wasteType } = req.body || {};
     if (!userId || !requestId) return res.status(400).json({ error: "Missing userId or requestId" });
@@ -344,7 +372,7 @@ app.post("/request-created", async (req, res) => {
 });
 
 // Notify user when their request is accepted by admin (called from admin client)
-app.post("/request-accepted", async (req, res) => {
+app.post("/request-accepted", requireAuth, assertAdmin, async (req, res) => {
   try {
     const { userId, requestId, wasteType } = req.body || {};
     if (!userId || !requestId) return res.status(400).json({ error: "Missing userId or requestId" });
@@ -375,6 +403,7 @@ app.get("/analytics/recycling", async (req, res) => {
 
     // Aggregate amounts paid from wallet transactions: Recycle Credit
     const txSnap = await walletRef.where("type", "==", "Recycle Credit").get();
+    let totalCo2FromTx = 0;
     txSnap.forEach((doc) => {
       const d = doc.data();
       if (d.amount) totalPaid += d.amount;
@@ -382,15 +411,28 @@ app.get("/analytics/recycling", async (req, res) => {
 
     // Per-type breakdown: infer from wallet_transactions details field and/or waste_prices
     const typeBreakdown = {};
+    let totalKgFromTx = 0;
     txSnap.forEach((doc) => {
       const d = doc.data();
-      const details = (d.details || "").toString();
-      // Expected format: "Credited for recycling Xkg of Y"
-      const match = details.match(/recycling\s+(\d+(?:\.\d+)?)kg\s+of\s+([A-Za-z\s]+)/i);
-      if (match) {
-        const kg = parseFloat(match[1]);
-        const type = match[2].trim();
-        typeBreakdown[type] = (typeBreakdown[type] || 0) + kg;
+      // Prefer explicit weight field when present; otherwise parse from details
+      let kg = 0;
+      let type = (d.wasteType || "").toString();
+      if (typeof d.weight === "number") {
+        kg = d.weight;
+      } else {
+        const details = (d.details || "").toString();
+        const match = details.match(/recycling\s+(\d+(?:\.\d+)?)kg\s+of\s+([A-Za-z\s]+)/i);
+        if (match) {
+          kg = parseFloat(match[1]);
+          if (!type) type = match[2].trim();
+        }
+      }
+      if (kg > 0) {
+        totalKgFromTx += kg;
+        totalCo2FromTx += kg * 1.5;
+        if (type) {
+          typeBreakdown[type] = (typeBreakdown[type] || 0) + kg;
+        }
       }
     });
 
@@ -421,8 +463,9 @@ app.get("/analytics/recycling", async (req, res) => {
 
     return res.json({
       totals: {
-        kg: totalKg,
-        co2: totalCo2,
+        // Prefer transaction-derived total when available to avoid stale user aggregates
+        kg: totalKgFromTx > 0 ? totalKgFromTx : totalKg,
+        co2: totalCo2FromTx > 0 ? totalCo2FromTx : totalCo2,
         amount_paid: totalPaid,
       },
       per_type_kg: typeBreakdown,
