@@ -75,6 +75,37 @@ app.get("/health", (_, res) => res.json({
   version: "1.0.0"
 }));
 
+// --- Push Notifications Helpers ---
+async function sendToUserToken(userId, notification, data = {}) {
+  try {
+    const snap = await usersRef.doc(userId).get();
+    if (!snap.exists) return { success: false, error: "User not found" };
+    const token = snap.data().fcmToken;
+    if (!token) return { success: false, error: "No fcmToken" };
+    await admin.messaging().send({
+      token,
+      notification,
+      data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])),
+    });
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
+
+async function sendToAdmins(notification, data = {}) {
+  try {
+    await admin.messaging().send({
+      topic: "admins",
+      notification,
+      data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])),
+    });
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
+
 // 📊 Analytics Endpoints
 app.get("/analytics/users", async (req, res) => {
   try {
@@ -139,6 +170,184 @@ app.get("/analytics/transactions", async (req, res) => {
   } catch (err) {
     console.error("Analytics error:", err);
     res.status(500).json({ error: "Failed to fetch transaction analytics" });
+  }
+});
+
+// Transactions query with filters and pagination
+app.get("/transactions/query", async (req, res) => {
+  try {
+    const {
+      type = "any",
+      status = "any",
+      start,
+      end,
+      search = "",
+      limit = "100",
+      startAfter: startAfterId,
+    } = req.query;
+
+    const parsedLimit = Math.max(1, Math.min(parseInt(limit, 10) || 100, 500));
+
+    let query = walletRef.orderBy("timestamp", "desc");
+    if (start) {
+      const startDate = new Date(start);
+      if (!isNaN(startDate.getTime())) {
+        query = query.where("timestamp", ">=", admin.firestore.Timestamp.fromDate(startDate));
+      }
+    }
+    if (end) {
+      const endDate = new Date(end);
+      if (!isNaN(endDate.getTime())) {
+        query = query.where("timestamp", "<=", admin.firestore.Timestamp.fromDate(endDate));
+      }
+    }
+
+    if (startAfterId) {
+      const docSnap = await walletRef.doc(startAfterId).get();
+      if (docSnap.exists) {
+        query = query.startAfter(docSnap);
+      }
+    }
+
+    const snap = await query.limit(parsedLimit).get();
+    let items = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    const loweredSearch = String(search || "").toLowerCase();
+
+    // In-memory filters for type/status/search to avoid composite index requirements
+    items = items.filter((it) => {
+      if (type !== "any" && String(it.type || "") !== type) return false;
+      if (status !== "any" && String(it.status || "") !== status) return false;
+      if (loweredSearch) {
+        const hay = `${String(it.details || "").toLowerCase()} ${String(it.userId || "").toLowerCase()}`;
+        if (!hay.includes(loweredSearch)) return false;
+      }
+      return true;
+    });
+
+    const nextPageToken = snap.size === parsedLimit ? snap.docs[snap.docs.length - 1].id : null;
+    return res.json({ items, nextPageToken, count: items.length });
+  } catch (err) {
+    console.error("Transactions query error:", err);
+    return res.status(500).json({ error: "Failed to query transactions", details: err.message });
+  }
+});
+
+// Transactions export as CSV
+app.get("/transactions/export", async (req, res) => {
+  try {
+    const { type = "any", status = "any", start, end, search = "", limit = "1000" } = req.query;
+    const max = Math.max(1, Math.min(parseInt(limit, 10) || 1000, 5000));
+
+    let query = walletRef.orderBy("timestamp", "desc");
+    if (start) {
+      const startDate = new Date(start);
+      if (!isNaN(startDate.getTime())) {
+        query = query.where("timestamp", ">=", admin.firestore.Timestamp.fromDate(startDate));
+      }
+    }
+    if (end) {
+      const endDate = new Date(end);
+      if (!isNaN(endDate.getTime())) {
+        query = query.where("timestamp", "<=", admin.firestore.Timestamp.fromDate(endDate));
+      }
+    }
+
+    let collected = [];
+    let pageQuery = query.limit(Math.min(max, 500));
+    let lastDoc = null;
+    while (collected.length < max) {
+      const snap = await pageQuery.get();
+      if (snap.empty) break;
+      const batch = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      collected = collected.concat(batch);
+      lastDoc = snap.docs[snap.docs.length - 1];
+      pageQuery = query.startAfter(lastDoc).limit(Math.min(max - collected.length, 500));
+      if (snap.size < 1) break;
+    }
+
+    const loweredSearch = String(search || "").toLowerCase();
+    let rows = collected.filter((it) => {
+      if (type !== "any" && String(it.type || "") !== type) return false;
+      if (status !== "any" && String(it.status || "") !== status) return false;
+      if (loweredSearch) {
+        const hay = `${String(it.details || "").toLowerCase()} ${String(it.userId || "").toLowerCase()}`;
+        if (!hay.includes(loweredSearch)) return false;
+      }
+      return true;
+    });
+
+    // CSV header
+    const header = [
+      "id",
+      "userId",
+      "type",
+      "status",
+      "amount",
+      "phone",
+      "details",
+      "relatedRequest",
+      "timestamp",
+    ];
+
+    const toCsv = (val) => {
+      if (val === null || val === undefined) return "";
+      const str = String(val).replace(/"/g, '""');
+      return `"${str}"`;
+    };
+
+    const lines = [header.join(",")];
+    for (const it of rows) {
+      const ts = it.timestamp && it.timestamp.toDate ? it.timestamp.toDate().toISOString() : "";
+      lines.push([
+        it.id,
+        it.userId || "",
+        it.type || "",
+        it.status || "",
+        it.amount != null ? it.amount : "",
+        it.phone || "",
+        it.details || "",
+        it.relatedRequest || "",
+        ts,
+      ].map(toCsv).join(","));
+    }
+
+    const csv = lines.join("\n");
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", "attachment; filename=transactions.csv");
+    return res.status(200).send(csv);
+  } catch (err) {
+    console.error("Transactions export error:", err);
+    return res.status(500).json({ error: "Failed to export transactions", details: err.message });
+  }
+});
+
+// Notify admins when a new recycling request is created (called from client)
+app.post("/request-created", async (req, res) => {
+  try {
+    const { userId, requestId, wasteType } = req.body || {};
+    if (!userId || !requestId) return res.status(400).json({ error: "Missing userId or requestId" });
+    await sendToAdmins({
+      title: "New Pickup Request",
+      body: `User ${userId} requested pickup${wasteType ? ` (${wasteType})` : ""}`,
+    }, { requestId, userId });
+    return res.json({ success: true });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Notify user when their request is accepted by admin (called from admin client)
+app.post("/request-accepted", async (req, res) => {
+  try {
+    const { userId, requestId, wasteType } = req.body || {};
+    if (!userId || !requestId) return res.status(400).json({ error: "Missing userId or requestId" });
+    await sendToUserToken(userId, {
+      title: "Pickup Accepted",
+      body: `Your pickup request${wasteType ? ` (${wasteType})` : ""} was accepted.`,
+    }, { route: "/recycling_requests", requestId });
+    return res.json({ success: true });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
   }
 });
 
@@ -662,6 +871,18 @@ app.post("/request-completed", async (req, res) => {
           processedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
       });
+      // Notify user about credit and admins about completion
+      try {
+        await sendToUserToken(userId, {
+          title: "Recycling Completed",
+          body: `Credited ${amount.toFixed(2)} for ${weight}kg of ${normalized}`,
+        }, { route: "/wallet" });
+        await sendToAdmins({
+          title: "Request Completed",
+          body: `User ${userId} credited ${amount.toFixed(2)} (${weight}kg ${normalized})`,
+        }, { requestId });
+      } catch (_) {}
+
       return res.json({ success: true });
     } else {
       return res.status(200).json({ message: "No update needed" });
