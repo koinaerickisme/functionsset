@@ -184,6 +184,7 @@ app.get("/transactions/query", async (req, res) => {
       search = "",
       limit = "100",
       startAfter: startAfterId,
+      wasteType = "any",
     } = req.query;
 
     const parsedLimit = Math.max(1, Math.min(parseInt(limit, 10) || 100, 500));
@@ -217,8 +218,9 @@ app.get("/transactions/query", async (req, res) => {
     items = items.filter((it) => {
       if (type !== "any" && String(it.type || "") !== type) return false;
       if (status !== "any" && String(it.status || "") !== status) return false;
+      if (wasteType !== "any" && String(it.wasteType || "") !== wasteType) return false;
       if (loweredSearch) {
-        const hay = `${String(it.details || "").toLowerCase()} ${String(it.userId || "").toLowerCase()}`;
+        const hay = `${String(it.details || "").toLowerCase()} ${String(it.userId || "").toLowerCase()} ${String(it.wasteType || "").toLowerCase()}`;
         if (!hay.includes(loweredSearch)) return false;
       }
       return true;
@@ -235,7 +237,7 @@ app.get("/transactions/query", async (req, res) => {
 // Transactions export as CSV
 app.get("/transactions/export", async (req, res) => {
   try {
-    const { type = "any", status = "any", start, end, search = "", limit = "1000" } = req.query;
+    const { type = "any", status = "any", start, end, search = "", limit = "1000", wasteType = "any" } = req.query;
     const max = Math.max(1, Math.min(parseInt(limit, 10) || 1000, 5000));
 
     let query = walletRef.orderBy("timestamp", "desc");
@@ -269,8 +271,9 @@ app.get("/transactions/export", async (req, res) => {
     let rows = collected.filter((it) => {
       if (type !== "any" && String(it.type || "") !== type) return false;
       if (status !== "any" && String(it.status || "") !== status) return false;
+      if (wasteType !== "any" && String(it.wasteType || "") !== wasteType) return false;
       if (loweredSearch) {
-        const hay = `${String(it.details || "").toLowerCase()} ${String(it.userId || "").toLowerCase()}`;
+        const hay = `${String(it.details || "").toLowerCase()} ${String(it.userId || "").toLowerCase()} ${String(it.wasteType || "").toLowerCase()}`;
         if (!hay.includes(loweredSearch)) return false;
       }
       return true;
@@ -283,6 +286,8 @@ app.get("/transactions/export", async (req, res) => {
       "type",
       "status",
       "amount",
+      "wasteType",
+      "weight",
       "phone",
       "details",
       "relatedRequest",
@@ -304,6 +309,8 @@ app.get("/transactions/export", async (req, res) => {
         it.type || "",
         it.status || "",
         it.amount != null ? it.amount : "",
+        it.wasteType || "",
+        it.weight != null ? it.weight : "",
         it.phone || "",
         it.details || "",
         it.relatedRequest || "",
@@ -862,6 +869,8 @@ app.post("/request-completed", async (req, res) => {
           userId,
           type: "Recycle Credit",
           amount,
+          wasteType: normalized,
+          weight: weight,
           relatedRequest: requestId,
           timestamp: admin.firestore.FieldValue.serverTimestamp(),
           status: "completed",
