@@ -698,7 +698,12 @@ app.post("/cleanup-expired-otps", async (req, res) => {
   }
 });
 
+// Export for serverless (e.g., Vercel) or start server when run directly
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+  });
+} else {
+  module.exports = app;
+}
