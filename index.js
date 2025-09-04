@@ -84,12 +84,14 @@ app.get("/analytics/users", async (req, res) => {
     let verifiedUsers = 0;
     let totalWalletBalance = 0;
     let totalRecycledWeight = 0;
+    let totalCo2Saved = 0;
     
     usersSnapshot.forEach(doc => {
       const data = doc.data();
       if (data.phoneVerified) verifiedUsers++;
       if (data.walletBalance) totalWalletBalance += data.walletBalance;
       if (data.recycledWeight) totalRecycledWeight += data.recycledWeight;
+      if (data.co2Saved) totalCo2Saved += data.co2Saved;
     });
     
     res.json({
@@ -98,6 +100,7 @@ app.get("/analytics/users", async (req, res) => {
       verification_rate: totalUsers > 0 ? (verifiedUsers / totalUsers * 100).toFixed(2) : 0,
       total_wallet_balance: totalWalletBalance,
       total_recycled_weight: totalRecycledWeight,
+      total_co2_saved: totalCo2Saved,
       timestamp: new Date().toISOString()
     });
   } catch (err) {
@@ -136,6 +139,83 @@ app.get("/analytics/transactions", async (req, res) => {
   } catch (err) {
     console.error("Analytics error:", err);
     res.status(500).json({ error: "Failed to fetch transaction analytics" });
+  }
+});
+
+// Recycling analytics: kg per waste type, totals, and last 12 months trend
+app.get("/analytics/recycling", async (req, res) => {
+  try {
+    // Aggregate from users for totals
+    const usersSnapshot = await usersRef.get();
+    let totalKg = 0;
+    let totalCo2 = 0;
+    let totalPaid = 0;
+
+    usersSnapshot.forEach((doc) => {
+      const d = doc.data();
+      if (d.recycledWeight) totalKg += d.recycledWeight;
+      if (d.co2Saved) totalCo2 += d.co2Saved;
+    });
+
+    // Aggregate amounts paid from wallet transactions: Recycle Credit
+    const txSnap = await walletRef.where("type", "==", "Recycle Credit").get();
+    txSnap.forEach((doc) => {
+      const d = doc.data();
+      if (d.amount) totalPaid += d.amount;
+    });
+
+    // Per-type breakdown: infer from wallet_transactions details field and/or waste_prices
+    const typeBreakdown = {};
+    txSnap.forEach((doc) => {
+      const d = doc.data();
+      const details = (d.details || "").toString();
+      // Expected format: "Credited for recycling Xkg of Y"
+      const match = details.match(/recycling\s+(\d+(?:\.\d+)?)kg\s+of\s+([A-Za-z\s]+)/i);
+      if (match) {
+        const kg = parseFloat(match[1]);
+        const type = match[2].trim();
+        typeBreakdown[type] = (typeBreakdown[type] || 0) + kg;
+      }
+    });
+
+    // Monthly trend for last 12 months from wallet_transactions timestamps
+    const now = new Date();
+    const start = new Date(now.getFullYear(), now.getMonth() - 11, 1);
+    const monthly = {};
+    txSnap.forEach((doc) => {
+      const d = doc.data();
+      const ts = d.timestamp && d.timestamp.toDate ? d.timestamp.toDate() : null;
+      const details = (d.details || "").toString();
+      const m = details.match(/recycling\s+(\d+(?:\.\d+)?)kg/i);
+      const kg = m ? parseFloat(m[1]) : 0;
+      if (!ts || isNaN(kg)) return;
+      if (ts < start) return;
+      const key = `${ts.getFullYear()}-${String(ts.getMonth() + 1).padStart(2, "0")}`;
+      monthly[key] = (monthly[key] || 0) + kg;
+    });
+
+    // Normalize last 12 months keys
+    const months = [];
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+      months.push(key);
+    }
+    const monthlyKg = months.map((k) => ({ month: k, kg: monthly[k] || 0 }));
+
+    return res.json({
+      totals: {
+        kg: totalKg,
+        co2: totalCo2,
+        amount_paid: totalPaid,
+      },
+      per_type_kg: typeBreakdown,
+      monthly_kg: monthlyKg,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("Analytics error:", err);
+    return res.status(500).json({ error: "Failed to fetch recycling analytics" });
   }
 });
 
