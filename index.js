@@ -1073,9 +1073,24 @@ app.post("/reconcile-completions", async (req, res) => {
 
 function normalizeWasteType(str) {
   if (!str || typeof str !== "string") return "";
-  let formatted = str.trim().charAt(0).toUpperCase() + str.trim().slice(1).toLowerCase();
-  if (!formatted.endsWith("s")) formatted += "s";
-  return formatted;
+  const raw = str.trim();
+  const upper = raw.toUpperCase();
+  // Treat common acronyms as-is (no pluralization/lowercasing)
+  const ACRONYMS = new Set(["PET", "HDPE", "LDPE", "PVC", "PP", "PS"]);
+  if (ACRONYMS.has(upper)) return upper;
+  // Title-case words, keep acronyms uppercased
+  const words = raw
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((w) => (ACRONYMS.has(w.toUpperCase()) ? w.toUpperCase() : (w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())));
+  if (words.length === 0) return "";
+  // Pluralize last word when not an acronym and not already ending with 's'
+  const lastIdx = words.length - 1;
+  const lastUpper = words[lastIdx].toUpperCase();
+  if (!ACRONYMS.has(lastUpper) && !words[lastIdx].endsWith("s")) {
+    words[lastIdx] = words[lastIdx] + "s";
+  }
+  return words.join(" ");
 }
 
 // Utility endpoint to clean up expired OTPs (optional - run periodically)
