@@ -402,7 +402,7 @@ app.get("/transactions/export", async (req, res) => {
 });
 
 // Notify admins when a new recycling request is created (called from client)
-app.post("/request-created", requireAuth, async (req, res) => {
+app.post("/request-created", async (req, res) => {
   try {
     const { userId, requestId, wasteType } = req.body || {};
     if (!userId || !requestId) return res.status(400).json({ error: "Missing userId or requestId" });
@@ -421,6 +421,15 @@ app.post("/request-accepted", requireAuth, assertAdmin, async (req, res) => {
   try {
     const { userId, requestId, wasteType } = req.body || {};
     if (!userId || !requestId) return res.status(400).json({ error: "Missing userId or requestId" });
+    // Write admin action to Firestore to make dashboard reactive
+    await walletRef.doc().set({
+      userId,
+      type: "Admin Action",
+      status: "request_accepted",
+      details: `Request ${requestId} accepted`,
+      relatedRequest: requestId,
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+    });
     await sendToUserToken(userId, {
       title: "Pickup Accepted",
       body: `Your pickup request${wasteType ? ` (${wasteType})` : ""} was accepted.`,
@@ -951,11 +960,9 @@ app.post("/request-completed", async (req, res) => {
       if (processedDoc.exists) {
         return res.status(200).json({ message: "Already processed" });
       }
+      // Default to 0 if price not found; still update recycled stats and write tx
       const priceSnap = await wastePricesRef.doc(normalized).get();
-      if (!priceSnap.exists) {
-        return res.status(400).json({ error: "Waste price not found" });
-      }
-      const pricePerKg = priceSnap.data().pricePerKg;
+      const pricePerKg = priceSnap.exists ? (priceSnap.data().pricePerKg || 0) : 0;
       const amount = weight * pricePerKg;
       const userRef = usersRef.doc(userId);
       await db.runTransaction(async (tx) => {
