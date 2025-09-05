@@ -66,7 +66,24 @@ const processedRequestsRef = db.collection("processed_requests");
 const app = express();
 // External services
 const PAYMENT_SERVICE_URL = process.env.PAYMENT_SERVICE_URL || "https://payment-service-a3t5.onrender.com";
-app.use(cors());
+const INTERNAL_SHARED_SECRET = process.env.INTERNAL_SHARED_SECRET || "";
+// CORS with configurable origins (default '*')
+const allowedOrigins = (process.env.CORS_ORIGINS || "*")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes("*") || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
+    credentials: true,
+  })
+);
 app.use(express.json());
 app.use(requestLogger);
 
@@ -777,7 +794,7 @@ app.post("/withdraw", async (req, res) => {
 });
 
 // B2C endpoint: deduct wallet, log transaction, then call Python payout service
-app.post("/b2c", async (req, res) => {
+app.post("/b2c", requireAuth, async (req, res) => {
   try {
     const schema = z.object({
       user_id: z.string(),
@@ -789,6 +806,9 @@ app.post("/b2c", async (req, res) => {
       return res.status(400).json({ error: parsed.error.errors[0].message });
     }
     const { user_id, phone, amount } = parsed.data;
+    if (req.user.uid !== user_id) {
+      return res.status(403).json({ error: "Forbidden: user mismatch" });
+    }
     const normalizedPhone = normalizeKenyanNumber(phone);
     const userRef = usersRef.doc(user_id);
     await db.runTransaction(async (tx) => {
@@ -836,6 +856,13 @@ app.post("/b2c", async (req, res) => {
 // B2C result callback
 app.post("/b2c/result", async (req, res) => {
   try {
+    // Optional internal auth: shared secret header
+    if (INTERNAL_SHARED_SECRET) {
+      const headerSecret = req.headers["x-internal-secret"] || req.headers["x-internal-auth"];
+      if (!headerSecret || String(headerSecret) !== INTERNAL_SHARED_SECRET) {
+        return res.status(401).send("Unauthorized");
+      }
+    }
     const result = req.body.Result;
     if (!result || !result.ResultParameters) {
       return res.status(400).send("Missing result data");
