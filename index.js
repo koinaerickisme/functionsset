@@ -1016,10 +1016,10 @@ app.post("/reconcile-completions", async (req, res) => {
     const { limit = 50 } = req.body || {};
     const capped = Math.max(1, Math.min(parseInt(limit, 10) || 50, 200));
     // Fetch recently completed recycling_requests
+    // Avoid requiring a composite index: fetch recent completed without orderBy
     const snap = await db
       .collection("recycling_requests")
       .where("status", "==", "completed")
-      .orderBy("completedAt", "desc")
       .limit(capped)
       .get();
     let processedCount = 0;
