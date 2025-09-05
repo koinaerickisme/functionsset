@@ -1010,6 +1010,67 @@ app.post("/request-completed", async (req, res) => {
   }
 });
 
+// Reconcile: scan recent completed requests and process any not yet credited
+app.post("/reconcile-completions", async (req, res) => {
+  try {
+    const { limit = 50 } = req.body || {};
+    const capped = Math.max(1, Math.min(parseInt(limit, 10) || 50, 200));
+    // Fetch recently completed recycling_requests
+    const snap = await db
+      .collection("recycling_requests")
+      .where("status", "==", "completed")
+      .orderBy("completedAt", "desc")
+      .limit(capped)
+      .get();
+    let processedCount = 0;
+    for (const doc of snap.docs) {
+      const requestId = doc.id;
+      const data = doc.data() || {};
+      const already = await processedRequestsRef.doc(requestId).get();
+      if (already.exists) continue;
+      const userId = data.userId;
+      const weight = data.weight;
+      const wasteTypeRaw = data.wasteType || "";
+      if (!userId || !weight || !wasteTypeRaw) continue;
+      const normalized = normalizeWasteType(String(wasteTypeRaw));
+      // Price (fallback to 0 if not set)
+      const priceSnap = await wastePricesRef.doc(normalized).get();
+      const pricePerKg = priceSnap.exists ? (priceSnap.data().pricePerKg || 0) : 0;
+      const amount = weight * pricePerKg;
+      const userRef = usersRef.doc(userId);
+      await db.runTransaction(async (tx) => {
+        const userSnap = await tx.get(userRef);
+        if (!userSnap.exists) return; // skip if user missing
+        tx.update(userRef, {
+          walletBalance: admin.firestore.FieldValue.increment(amount),
+          recycledWeight: admin.firestore.FieldValue.increment(weight),
+          pointsEarned: admin.firestore.FieldValue.increment(weight / 50),
+          co2Saved: admin.firestore.FieldValue.increment(weight * 1.5),
+        });
+        tx.set(walletRef.doc(), {
+          userId,
+          type: "Recycle Credit",
+          amount,
+          wasteType: normalized,
+          weight,
+          relatedRequest: requestId,
+          timestamp: admin.firestore.FieldValue.serverTimestamp(),
+          status: "completed",
+          details: `Credited for recycling ${weight}kg of ${normalized} (reconcile)`,
+        });
+        tx.set(processedRequestsRef.doc(requestId), {
+          processedAt: admin.firestore.FieldValue.serverTimestamp(),
+          method: "reconcile",
+        });
+      });
+      processedCount++;
+    }
+    return res.json({ success: true, processed: processedCount });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 function normalizeWasteType(str) {
   if (!str || typeof str !== "string") return "";
   let formatted = str.trim().charAt(0).toUpperCase() + str.trim().slice(1).toLowerCase();
