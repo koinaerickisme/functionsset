@@ -461,11 +461,15 @@ app.get("/analytics/recycling", async (req, res) => {
     }
     const monthlyKg = months.map((k) => ({ month: k, kg: monthly[k] || 0 }));
 
+    // Resolve totals: prefer sum of per-type kgs when available
+    const sumPerTypeKg = Object.values(typeBreakdown).reduce((acc, v) => acc + v, 0);
+    const resolvedKg = sumPerTypeKg > 0 ? sumPerTypeKg : (totalKgFromTx > 0 ? totalKgFromTx : totalKg);
+    const resolvedCo2 = sumPerTypeKg > 0 ? sumPerTypeKg * 1.5 : (totalCo2FromTx > 0 ? totalCo2FromTx : totalCo2);
+
     return res.json({
       totals: {
-        // Prefer transaction-derived total when available to avoid stale user aggregates
-        kg: totalKgFromTx > 0 ? totalKgFromTx : totalKg,
-        co2: totalCo2FromTx > 0 ? totalCo2FromTx : totalCo2,
+        kg: resolvedKg,
+        co2: resolvedCo2,
         amount_paid: totalPaid,
       },
       per_type_kg: typeBreakdown,
