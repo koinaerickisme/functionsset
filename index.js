@@ -64,6 +64,8 @@ const wastePricesRef = db.collection("waste_prices");
 const processedRequestsRef = db.collection("processed_requests");
 
 const app = express();
+// External services
+const PAYMENT_SERVICE_URL = process.env.PAYMENT_SERVICE_URL || "https://payment-service-a3t5.onrender.com";
 app.use(cors());
 app.use(express.json());
 app.use(requestLogger);
@@ -198,6 +200,32 @@ app.get("/analytics/transactions", async (req, res) => {
   } catch (err) {
     console.error("Analytics error:", err);
     res.status(500).json({ error: "Failed to fetch transaction analytics" });
+  }
+});
+
+// Withdrawal analytics endpoint to unify analytics under functions backend
+app.get("/analytics/withdrawals", async (req, res) => {
+  try {
+    const withdrawalsSnap = await walletRef.where("type", "==", "Withdraw").get();
+    const totalWithdrawals = withdrawalsSnap.size;
+    let totalAmount = 0;
+    const statusCounts = {};
+    withdrawalsSnap.forEach((doc) => {
+      const d = doc.data();
+      const amount = typeof d.amount === "number" ? Math.abs(d.amount) : 0;
+      totalAmount += amount;
+      const status = (d.status || "unknown").toString();
+      statusCounts[status] = (statusCounts[status] || 0) + 1;
+    });
+    return res.json({
+      total_withdrawals: totalWithdrawals,
+      total_amount: totalAmount,
+      status_breakdown: statusCounts,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("Withdrawal analytics error:", err);
+    return res.status(500).json({ error: "Failed to fetch withdrawal analytics" });
   }
 });
 
@@ -782,7 +810,7 @@ app.post("/b2c", async (req, res) => {
     // Call Python payout service after wallet deduction
     let payoutResult = null;
     try {
-      const payoutResponse = await fetch("https://payment-service-a3t5.onrender.com/b2c", {
+      const payoutResponse = await fetch(`${PAYMENT_SERVICE_URL}/b2c`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
